@@ -1,173 +1,115 @@
-//! This contract implements simple counter backed by storage on blockchain.
-//!
-//! The contract provides methods to [increment] / [decrement] counter and
-//! [get it's current value][get_num] or [reset].
-//!
-//! [increment]: struct.Counter.html#method.increment
-//! [decrement]: struct.Counter.html#method.decrement
-//! [get_num]: struct.Counter.html#method.get_num
-//! [reset]: struct.Counter.html#method.reset
-
+/*!
+Fungible Token implementation with JSON serialization.
+NOTES:
+  - The maximum balance value is limited by U128 (2**128 - 1).
+  - JSON calls should pass U128 as a base-10 string. E.g. "100".
+  - The contract optimizes the inner trie structure by hashing account IDs. It will prevent some
+    abuse of deep tries. Shouldn't be an issue, once NEAR clients implement full hashing of keys.
+  - The contract tracks the change in storage before and after the call. If the storage increases,
+    the contract requires the caller of the contract to attach enough deposit to the function call
+    to cover the storage cost.
+    This is done to prevent a denial of service attack on the contract by taking all available storage.
+    If the storage decreases, the contract will issue a refund for the cost of the released storage.
+    The unused tokens from the attached deposit are also refunded, so it's safe to
+    attach more deposit than required.
+  - To prevent the deployed contract from being modified or deleted, it should not have any access
+    keys on its account.
+*/
+use near_contract_standards::fungible_token::metadata::{
+    FungibleTokenMetadata, FungibleTokenMetadataProvider, FT_METADATA_SPEC,
+};
+use near_contract_standards::fungible_token::FungibleToken;
 use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
-use near_sdk::{env, near_bindgen};
+use near_sdk::collections::LazyOption;
+use near_sdk::json_types::{ValidAccountId, U128};
+use near_sdk::{env, log, near_bindgen, AccountId, Balance, PanicOnDefault, PromiseOrValue};
 
 near_sdk::setup_alloc!();
 
-// This is a near official counter example: https://docs.near.org/docs/develop/contracts/rust/intro.
-
-// add the following attributes to prepare your code for serialization and invocation on the blockchain
-// More built-in Rust attributes here: https://doc.rust-lang.org/reference/attributes.html#built-in-attributes-index
 #[near_bindgen]
-#[derive(Default, BorshDeserialize, BorshSerialize)]
-pub struct Counter {
-    // See more data types at https://doc.rust-lang.org/book/ch03-02-data-types.html
-    val: i8, // i8 is signed. unsigned integers are also available: u8, u16, u32, u64, u128
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+pub struct Contract {
+    token: FungibleToken,
+    metadata: LazyOption<FungibleTokenMetadata>,
 }
+
+const DATA_IMAGE_SVG_NEAR_ICON: &str = "data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' class='svg-icon' style='width: 1em; height: 1em;vertical-align: middle;fill: currentColor;overflow: hidden;' viewBox='0 0 1024 1024' version='1.1'%3e%3cpath d='M70.6 267.1c11.3-19.6 36.4-26.3 55.9-15l372.8 215.3 369.1-213.1c19.6-11.3 44.6-4.6 55.9 15 0.2 0.3 0.3 0.5 0.4 0.8-3.5-7-8.9-13-16.2-17.2L521.7 29.5c-7.5-6.1-16.9-9.3-26.4-9.2-9.5-0.1-18.9 3.1-26.4 9.2l-383 221.1c-10.1 5.8-16.8 15.4-19.3 25.9 0.9-3.1 2.2-6.3 4-9.4z' fill='%23242424'/%3e%3cpath d='M925.5 271.5c9.6 19.2 2.7 42.9-16.2 53.8L543.4 536.5v429c0 22.6-18.3 41-41 41-22.6 0-41-18.3-41-41V540.1l-375.9-217c-11.9-6.9-19.1-18.8-20.3-31.6v446.1c-1.5 15.5 5.9 31.1 20.3 39.4l387.4 223.7c7.5 6.1 16.9 9.3 26.4 9.2 9.5 0.1 18.9-3.1 26.4-9.2l376-217.1c16.6-5.2 28.7-20.7 28.7-39.1V290.9c0-7.1-1.8-13.7-4.9-19.4z' fill='%23242424'/%3e%3c/svg%3e";
 
 #[near_bindgen]
-impl Counter {
-    /// Returns 8-bit signed integer of the counter value.
-    ///
-    /// This must match the type from our struct's 'val' defined above.
-    ///
-    /// Note, the parameter is `&self` (without being mutable) meaning it doesn't modify state.
-    /// In the frontend (/src/main.js) this is added to the "viewMethods" array
-    /// using near-cli we can call this by:
-    ///
-    /// ```bash
-    /// near view counter.YOU.testnet get_num
-    /// ```
-    pub fn get_num(&self) -> i8 {
-        return self.val;
+impl Contract {
+    #[init]
+    pub fn new() -> Self {
+        Self::internal_new(FungibleTokenMetadata {
+            spec: FT_METADATA_SPEC.to_string(),
+            name: "Metacraft Build token".to_string(),
+            symbol: "BUILD".to_string(),
+            icon: Some(DATA_IMAGE_SVG_NEAR_ICON.to_string()),
+            reference: None,
+            reference_hash: None,
+            decimals: 24,
+        })
     }
 
-    /// Increment the counter.
-    ///
-    /// Note, the parameter is "&mut self" as this function modifies state.
-    /// In the frontend (/src/main.js) this is added to the "changeMethods" array
-    /// using near-cli we can call this by:
-    ///
-    /// ```bash
-    /// near call counter.YOU.testnet increment --accountId donation.YOU.testnet
-    /// ```
-    pub fn increment(&mut self) {
-        // note: adding one like this is an easy way to accidentally overflow
-        // real smart contracts will want to have safety checks
-        // e.g. self.val = i8::wrapping_add(self.val, 1);
-        // https://doc.rust-lang.org/std/primitive.i8.html#method.wrapping_add
-        self.val += 1;
-        let log_message = format!("Increased number to {}", self.val);
-        env::log(log_message.as_bytes());
-        after_counter_change();
+    fn internal_new(metadata: FungibleTokenMetadata) -> Self {
+        assert!(!env::state_exists(), "Already initialized");
+        metadata.assert_valid();
+        let this = Self {
+            token: FungibleToken::new(b"a".to_vec()),
+            metadata: LazyOption::new(b"m".to_vec(), Some(&metadata)),
+        };
+        this
     }
 
-    /// Decrement (subtract from) the counter.
-    ///
-    /// In (/src/main.js) this is also added to the "changeMethods" array
-    /// using near-cli we can call this by:
-    ///
-    /// ```bash
-    /// near call counter.YOU.testnet decrement --accountId donation.YOU.testnet
-    /// ```
-    pub fn decrement(&mut self) {
-        // note: subtracting one like this is an easy way to accidentally overflow
-        // real smart contracts will want to have safety checks
-        // e.g. self.val = i8::wrapping_sub(self.val, 1);
-        // https://doc.rust-lang.org/std/primitive.i8.html#method.wrapping_sub
-        self.val -= 1;
-        let log_message = format!("Decreased number to {}", self.val);
-        env::log(log_message.as_bytes());
-        after_counter_change();
+    fn on_account_closed(&mut self, account_id: AccountId, balance: Balance) {
+        log!("Closed @{} with {}", account_id, balance);
     }
 
-    /// Reset to zero.
-    pub fn reset(&mut self) {
-        self.val = 0;
-        // Another way to log is to cast a string into bytes, hence "b" below:
-        env::log(b"Reset counter to zero");
+    fn on_tokens_burned(&mut self, account_id: AccountId, amount: Balance) {
+        log!("Account @{} burned {}", account_id, amount);
     }
 }
 
-// unlike the struct's functions above, this function cannot use attributes #[derive(…)] or #[near_bindgen]
-// any attempts will throw helpful warnings upon 'cargo build'
-// while this function cannot be invoked directly on the blockchain, it can be called from an invoked function
-fn after_counter_change() {
-    // show helpful warning that i8 (8-bit signed integer) will overflow above 127 or below -128
-    env::log("Make sure you don't overflow, my friend.".as_bytes());
+near_contract_standards::impl_fungible_token_core!(Contract, token, on_tokens_burned);
+near_contract_standards::impl_fungible_token_storage!(Contract, token, on_account_closed);
+
+#[near_bindgen]
+impl FungibleTokenMetadataProvider for Contract {
+    fn ft_metadata(&self) -> FungibleTokenMetadata {
+        self.metadata.get().unwrap()
+    }
 }
 
-/*
- * the rest of this file sets up unit tests
- * to run these, the command will be:
- * cargo test --package rust-counter-tutorial -- --nocapture
- * Note: 'rust-counter-tutorial' comes from cargo.toml's 'name' key
- */
-
-// use the attribute below for unit tests
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
-    use super::*;
+    use near_sdk::test_utils::{accounts, VMContextBuilder};
+    use near_sdk::testing_env;
     use near_sdk::MockedBlockchain;
-    use near_sdk::{testing_env, VMContext};
 
-    // part of writing unit tests is setting up a mock context
-    // in this example, this is only needed for env::log in the contract
-    // this is also a useful list to peek at when wondering what's available in env::*
-    fn get_context(input: Vec<u8>, is_view: bool) -> VMContext {
-        VMContext {
-            current_account_id: "alice.testnet".to_string(),
-            signer_account_id: "robert.testnet".to_string(),
-            signer_account_pk: vec![0, 1, 2],
-            predecessor_account_id: "jane.testnet".to_string(),
-            input,
-            block_index: 0,
-            block_timestamp: 0,
-            account_balance: 0,
-            account_locked_balance: 0,
-            storage_usage: 0,
-            attached_deposit: 0,
-            prepaid_gas: 10u64.pow(18),
-            random_seed: vec![0, 1, 2],
-            is_view,
-            output_data_receivers: vec![],
-            epoch_height: 19,
-        }
-    }
+    use super::*;
 
-    // mark individual unit tests with #[test] for them to be registered and fired
-    #[test]
-    fn increment() {
-        // set up the mock context into the testing environment
-        let context = get_context(vec![], false);
-        testing_env!(context);
-        // instantiate a contract variable with the counter at zero
-        let mut contract = Counter { val: 0 };
-        contract.increment();
-        println!("Value after increment: {}", contract.get_num());
-        // confirm that we received 1 when calling get_num
-        assert_eq!(1, contract.get_num());
+    fn get_context(predecessor_account_id: ValidAccountId) -> VMContextBuilder {
+        let mut builder = VMContextBuilder::new();
+        builder
+            .current_account_id(accounts(0))
+            .signer_account_id(predecessor_account_id.clone())
+            .predecessor_account_id(predecessor_account_id);
+        builder
     }
 
     #[test]
-    fn decrement() {
-        let context = get_context(vec![], false);
-        testing_env!(context);
-        let mut contract = Counter { val: 0 };
-        contract.decrement();
-        println!("Value after decrement: {}", contract.get_num());
-        // confirm that we received -1 when calling get_num
-        assert_eq!(-1, contract.get_num());
+    fn test_new() {
+        let mut context = get_context(accounts(1));
+        testing_env!(context.build());
+        let contract = Contract::new();
+        testing_env!(context.is_view(true).build());
+        assert_eq!(contract.ft_total_supply().0, 0);
     }
 
     #[test]
-    fn increment_and_reset() {
-        let context = get_context(vec![], false);
-        testing_env!(context);
-        let mut contract = Counter { val: 0 };
-        contract.increment();
-        contract.reset();
-        println!("Value after reset: {}", contract.get_num());
-        // confirm that we received -1 when calling get_num
-        assert_eq!(0, contract.get_num());
+    #[should_panic(expected = "The contract is not initialized")]
+    fn test_default() {
+        let context = get_context(accounts(1));
+        testing_env!(context.build());
+        let _contract = Contract::default();
     }
 }
