@@ -73,6 +73,7 @@ impl Contract {
         this
     }
 
+    #[payable]
     pub fn mint(&mut self, amount: U128) {
         let caller = env::predecessor_account_id();
         log!("calling mint!");
