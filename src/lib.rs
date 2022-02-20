@@ -15,9 +15,11 @@ NOTES:
   - To prevent the deployed contract from being modified or deleted, it should not have any access
     keys on its account.
 */
+use near_contract_standards::fungible_token::core::FungibleTokenCore;
 use near_contract_standards::fungible_token::metadata::{
     FungibleTokenMetadata, FungibleTokenMetadataProvider, FT_METADATA_SPEC,
 };
+use near_contract_standards::fungible_token::resolver::FungibleTokenResolver;
 use near_contract_standards::fungible_token::FungibleToken;
 use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
 use near_sdk::collections::LazyOption;
@@ -38,26 +40,51 @@ const DATA_IMAGE_SVG_NEAR_ICON: &str = "data:image/svg+xml;charset=UTF-8,%3csvg 
 #[near_bindgen]
 impl Contract {
     #[init]
-    pub fn new() -> Self {
-        Self::internal_new(FungibleTokenMetadata {
-            spec: FT_METADATA_SPEC.to_string(),
-            name: "Metacraft Build token".to_string(),
-            symbol: "BUILD".to_string(),
-            icon: Some(DATA_IMAGE_SVG_NEAR_ICON.to_string()),
-            reference: None,
-            reference_hash: None,
-            decimals: 24,
-        })
+    pub fn new(owner_id: ValidAccountId, total_supply: U128) -> Self {
+        Self::internal_new(
+            owner_id,
+            total_supply,
+            FungibleTokenMetadata {
+                spec: FT_METADATA_SPEC.to_string(),
+                name: "BUILD".to_string(),
+                symbol: "BUILD".to_string(),
+                icon: Some(DATA_IMAGE_SVG_NEAR_ICON.to_string()),
+                reference: None,
+                reference_hash: None,
+                decimals: 5,
+            },
+        )
     }
 
-    fn internal_new(metadata: FungibleTokenMetadata) -> Self {
+    fn internal_new(
+        owner_id: ValidAccountId,
+        total_supply: U128,
+        metadata: FungibleTokenMetadata,
+    ) -> Self {
         assert!(!env::state_exists(), "Already initialized");
         metadata.assert_valid();
-        let this = Self {
+        let mut this = Self {
             token: FungibleToken::new(b"a".to_vec()),
             metadata: LazyOption::new(b"m".to_vec(), Some(&metadata)),
         };
+        this.token.internal_register_account(owner_id.as_ref());
+        this.token
+            .internal_deposit(owner_id.as_ref(), total_supply.into());
         this
+    }
+
+    pub fn mint(&mut self, amount: U128) {
+        let caller = env::predecessor_account_id();
+        log!("calling mint!");
+        self.register_if_needed(&caller);
+        self.token.internal_deposit(&caller, amount.into());
+    }
+
+    fn register_if_needed(&mut self, account_id: &AccountId) {
+        let registered = self.token.accounts.contains_key(&account_id);
+        if !registered {
+            self.token.internal_register_account(&account_id);
+        }
     }
 
     fn on_account_closed(&mut self, account_id: AccountId, balance: Balance) {
@@ -69,7 +96,56 @@ impl Contract {
     }
 }
 
-near_contract_standards::impl_fungible_token_core!(Contract, token, on_tokens_burned);
+#[near_bindgen]
+impl FungibleTokenCore for Contract {
+    #[payable]
+    fn ft_transfer(&mut self, receiver_id: ValidAccountId, amount: U128, memo: Option<String>) {
+        self.register_if_needed(&receiver_id.clone().into());
+        self.token.ft_transfer(receiver_id, amount, memo)
+    }
+
+    #[payable]
+    fn ft_transfer_call(
+        &mut self,
+        receiver_id: ValidAccountId,
+        amount: U128,
+        memo: Option<String>,
+        msg: String,
+    ) -> PromiseOrValue<U128> {
+        self.register_if_needed(&receiver_id.clone().into());
+        self.token.ft_transfer_call(receiver_id, amount, memo, msg)
+    }
+
+    fn ft_total_supply(&self) -> U128 {
+        self.token.ft_total_supply()
+    }
+
+    fn ft_balance_of(&self, account_id: ValidAccountId) -> U128 {
+        self.token.ft_balance_of(account_id)
+    }
+}
+
+#[near_bindgen]
+impl FungibleTokenResolver for Contract {
+    #[private]
+    fn ft_resolve_transfer(
+        &mut self,
+        sender_id: ValidAccountId,
+        receiver_id: ValidAccountId,
+        amount: U128,
+    ) -> U128 {
+        let sender_id: AccountId = sender_id.into();
+        let (used_amount, burned_amount) =
+            self.token
+                .internal_ft_resolve_transfer(&sender_id, receiver_id, amount);
+        if burned_amount > 0 {
+            self.on_tokens_burned(sender_id, burned_amount);
+        }
+        used_amount.into()
+    }
+}
+
+// near_contract_standards::impl_fungible_token_core!(Contract, token, on_tokens_burned);
 near_contract_standards::impl_fungible_token_storage!(Contract, token, on_account_closed);
 
 #[near_bindgen]
@@ -87,6 +163,8 @@ mod tests {
 
     use super::*;
 
+    const TOTAL_SUPPLY: Balance = 1_000_000_000_000_000;
+
     fn get_context(predecessor_account_id: ValidAccountId) -> VMContextBuilder {
         let mut builder = VMContextBuilder::new();
         builder
@@ -100,9 +178,10 @@ mod tests {
     fn test_new() {
         let mut context = get_context(accounts(1));
         testing_env!(context.build());
-        let contract = Contract::new();
+        let contract = Contract::new(accounts(1).into(), TOTAL_SUPPLY.into());
         testing_env!(context.is_view(true).build());
-        assert_eq!(contract.ft_total_supply().0, 0);
+        assert_eq!(contract.ft_total_supply().0, TOTAL_SUPPLY);
+        assert_eq!(contract.ft_balance_of(accounts(1)).0, TOTAL_SUPPLY);
     }
 
     #[test]
@@ -111,5 +190,39 @@ mod tests {
         let context = get_context(accounts(1));
         testing_env!(context.build());
         let _contract = Contract::default();
+    }
+
+    #[test]
+    fn test_transfer() {
+        let mut context = get_context(accounts(2));
+        testing_env!(context.build());
+        let mut contract = Contract::new(accounts(2).into(), TOTAL_SUPPLY.into());
+        testing_env!(context
+            .storage_usage(env::storage_usage())
+            .attached_deposit(contract.storage_balance_bounds().min.into())
+            .predecessor_account_id(accounts(1))
+            .build());
+        // Paying for account registration, aka storage deposit
+        contract.storage_deposit(None, None);
+
+        testing_env!(context
+            .storage_usage(env::storage_usage())
+            .attached_deposit(1)
+            .predecessor_account_id(accounts(2))
+            .build());
+        let transfer_amount = TOTAL_SUPPLY / 3;
+        contract.ft_transfer(accounts(1), transfer_amount.into(), None);
+
+        testing_env!(context
+            .storage_usage(env::storage_usage())
+            .account_balance(env::account_balance())
+            .is_view(true)
+            .attached_deposit(0)
+            .build());
+        assert_eq!(
+            contract.ft_balance_of(accounts(2)).0,
+            (TOTAL_SUPPLY - transfer_amount)
+        );
+        assert_eq!(contract.ft_balance_of(accounts(1)).0, transfer_amount);
     }
 }
